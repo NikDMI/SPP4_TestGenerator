@@ -13,19 +13,39 @@ namespace TestGenerator.IGenerator
 {
     public class Generator : ITestGenerator
     {
-        public Task GetTestFiles(List<string> classFileNames, string resultDirectoryPath)
+        public Task GetTestFiles(List<string> classFileNames, string resultDirectoryPath, int loadMaxThreads, int parsingMaxThreads, int savingMaxThreads)
         {
-            if (!Directory.Exists(resultDirectoryPath))
+            //Check test directory
+            if (Directory.Exists(resultDirectoryPath))
             {
-                throw new ArgumentException ("Directory not founded");
+                _rootTestDirectory = resultDirectoryPath;
+            } 
+            else if (Directory.Exists(Environment.CurrentDirectory + "\\" + resultDirectoryPath))
+            {
+                _rootTestDirectory = Environment.CurrentDirectory + "\\" + resultDirectoryPath;
             }
-            _rootTestDirectory = resultDirectoryPath;
+            else
+            {
+                throw new ArgumentException("Directory not founded");
+            }
             //Create actions
+            if (loadMaxThreads <= 0 || parsingMaxThreads <= 0 || savingMaxThreads <= 0)
+            {
+                throw new ArgumentException("Bad degree of parallelizm");
+            }
+            //Create actions of pipeline
             ExecutionDataflowBlockOptions actionOptions = new ExecutionDataflowBlockOptions();
-            actionOptions.MaxDegreeOfParallelism = 3;
-            _generatorAction = new ActionBlock<string>(ParseClassFile, actionOptions);
-            _testGeneratorAction = new ActionBlock<SyntaxNode>(CreateTestFile, actionOptions);
-            _testSavingAction = new ActionBlock<string>(WriteTestToFile, actionOptions);
+            actionOptions.MaxDegreeOfParallelism = loadMaxThreads;
+            _generatorAction = new ActionBlock<string>(async fileName => await ParseClassFile(fileName), actionOptions);
+
+            ExecutionDataflowBlockOptions actionOptionsCreateFile = new ExecutionDataflowBlockOptions();
+            actionOptionsCreateFile.MaxDegreeOfParallelism = parsingMaxThreads;
+            _testGeneratorAction = new ActionBlock<SyntaxNode>(async classNode => await CreateTestFile(classNode), actionOptionsCreateFile);
+
+            ExecutionDataflowBlockOptions actionOptionsWriteTest = new ExecutionDataflowBlockOptions();
+            actionOptionsWriteTest.MaxDegreeOfParallelism = savingMaxThreads;
+            _testSavingAction = new ActionBlock<string>(async fileData => await WriteTestToFile(fileData), actionOptionsWriteTest);
+            //Add files to process into dataflow
             foreach (var classFileName in classFileNames)
             {
                 _generatorAction.Post(classFileName);
@@ -33,13 +53,14 @@ namespace TestGenerator.IGenerator
             //Create task to return to the user
             Task userTask = new Task(() =>
             {
-                _generatorAction.Complete();//Parse class files
-                _generatorAction.Completion.Wait();
-                _testGeneratorAction.Complete();//Generate test classes
-                _testGeneratorAction.Completion.Wait();
-                _testSavingAction.Complete();//Write test classes to files
-                _testSavingAction.Completion.Wait();
+                    _generatorAction.Complete();//Parse class files
+                    _generatorAction.Completion.Wait();
+                    _testGeneratorAction.Complete();//Generate test classes
+                    _testGeneratorAction.Completion.Wait();
+                    _testSavingAction.Complete();//Write test classes to files
+                    _testSavingAction.Completion.Wait();
             });
+            userTask.Start();
             return userTask;
         }
 
@@ -47,8 +68,16 @@ namespace TestGenerator.IGenerator
         /*
          * Create syntax tree from source code file
          */
-        private async void ParseClassFile(string fileName)
+        private async Task ParseClassFile(string fileName)
         {
+            if (!File.Exists(fileName))
+            {
+                fileName = Environment.CurrentDirectory + "\\" + fileName;
+                if (!File.Exists(fileName))
+                {
+                    throw new ArgumentException("File not found");
+                }
+            }
             //Read data in the file
             byte[] fileData = null;
             using (FileStream sourceStream = File.Open(fileName, FileMode.Open))
@@ -84,6 +113,9 @@ namespace TestGenerator.IGenerator
         }
 
 
+        /*
+         * Creates sting representation of the method node
+         */
         private async Task CreateTestFile(SyntaxNode classNode)
         {
             ClassDeclarationSyntax classDeclarationSyntax = (ClassDeclarationSyntax)classNode;
@@ -155,13 +187,7 @@ namespace TestGenerator.IGenerator
                         SyntaxFactory.IdentifierName("Tests")))
             .WithMembers(
             SyntaxFactory.SingletonList<MemberDeclarationSyntax>(
-                SyntaxFactory.ClassDeclaration(className)
-                .WithAttributeLists(
-                   SyntaxFactory.SingletonList<AttributeListSyntax>(
-                        SyntaxFactory.AttributeList(
-                            SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(
-                                SyntaxFactory.Attribute(
-                                    SyntaxFactory.IdentifierName("Test"))))))
+                SyntaxFactory.ClassDeclaration(className + "Test")
                 .WithModifiers(
                     SyntaxFactory.TokenList(
                         SyntaxFactory.Token(SyntaxKind.PublicKeyword)))
@@ -216,17 +242,18 @@ namespace TestGenerator.IGenerator
         }
 
 
-        private async void WriteTestToFile(string fileData)
+        private async Task WriteTestToFile(string fileData)
         {
             byte[] data = Encoding.UTF8.GetBytes(fileData);
             string filePath = "";
             lock (_rootTestDirectory) 
             {
-                filePath = _rootTestDirectory + _currentTestFileId++ + ".cs";
+                filePath = _rootTestDirectory + "\\" + _currentTestFileId++ + ".cs";
             }
             using (FileStream fs = new FileStream(filePath, FileMode.OpenOrCreate))
             {
                 await fs.WriteAsync(data, 0, data.Length);
+                fs.Flush();
             }
         }
 
